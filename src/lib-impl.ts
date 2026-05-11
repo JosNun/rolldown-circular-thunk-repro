@@ -1,6 +1,5 @@
-// Module-level const that's USED by an exported function. If the module is
-// wrapped in a lazy init thunk and the thunk isn't invoked, `fn` is undefined
-// when `foo()` runs.
+// Module-level state used by an exported function. The same pattern d3-scale
+// uses for `var unit = [0, 1]` and `var index = new InternMap()`.
 export function foo(): number {
   return fn();
 }

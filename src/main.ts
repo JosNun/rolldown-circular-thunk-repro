@@ -1,10 +1,13 @@
-// Main entry: lazy-loads trigger-error and (separately) trigger-wrapping.
-// In production the user lands on one route or the other; never both.
 const out = document.getElementById("out")!;
+const params = location.search;
 
-if (location.search.includes("wrapping")) {
+if (params.includes("wrapping")) {
   import("./trigger-wrapping").then(() => {
     out.textContent = "loaded wrapping route";
+  });
+} else if (params.includes("other")) {
+  import("./trigger-other").then((m) => {
+    out.textContent = `OK: ${m.checkOther()}`;
   });
 } else {
   import("./trigger-error").then((m) => {
