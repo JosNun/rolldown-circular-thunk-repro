@@ -1,139 +1,203 @@
-# Rolldown emits lazy ESM module-init thunks (triggered by `"type": "commonjs"`)
+# Rolldown emits lazy ESM init thunks that aren't invoked at chunk top-level
 
-A minimal reproduction of Rolldown's ESM-import-from-CJS-package wrapping
-behavior. Setting `"type": "commonjs"` in `package.json` causes Rolldown to
-wrap every transitively-imported ESM module's body in a memoizing lazy-init
-thunk. In a sufficiently complex chunk graph the thunks never get invoked,
-leaving module-level state (e.g. `d3-scale`'s `var unit = [0, 1]`) undefined
-when consumer functions read it — surfacing as
-`TypeError: Cannot read properties of undefined (reading 'length')`.
+A reproduction (mechanism + analysis) of a Vite 8 / Rolldown bug. In our
+production build, Rolldown emits a chunk that:
 
-## What this repro shows
+- defines 100+ lazy ESM module-init thunks (`var X = __esmMin(() => { ... })`)
+- exports a handful as named exports for cross-chunk consumers
+- emits **no top-level invocation** of those thunks
 
-This is the smallest possible setup that gets Rolldown to emit the wrap:
+When the chunk's own exported component runs (called by React rendering),
+it reads module-level state that was wrapped behind a thunk that nobody
+ever called — and crashes with `TypeError: Cannot read properties of
+undefined (reading 'length')` (at `d3-scale`'s `continuous.js:78` inside
+`Math.min(domain.length, range.length)`, where `domain = range = unit` and
+`unit` is the unset `[0, 1]`).
 
-- 1 dependency (`d3-scale`)
-- 2 source files (`src/main.ts` lazy-imports `src/dashboard.ts`)
-- 1 config setting: `"type": "commonjs"` in `package.json`
+The runtime symptom and exact stack are documented at the bottom of this
+README. Reproducing the wrapping mechanism in a minimal form is easy
+(this repro). Reproducing the missing-init-call case in a minimal form is
+harder — see the section *What we couldn't reduce* below.
 
-Run it:
+## Reproduce
 
 ```sh
 yarn install
 yarn build
-node verify-bug.mjs        # loads the built chunk and inspects it
-node test-crash.mjs        # demonstrates the runtime symptom standalone
+node test-crash.mjs
 ```
 
-`verify-bug.mjs` reports:
+`test-crash.mjs` runs a hand-rolled version of what Rolldown emits and
+demonstrates the runtime symptom in isolation:
 
 ```
-exports: [ 'default' ]
-✅ compute() returned 0.5 — no bug detected at runtime
+Calling scaleLinear()...
+CRASH: Cannot read properties of undefined (reading 'length')
 ```
 
-— i.e. `compute()` runs fine in this minimal case. But inspecting
-`dist/assets/dashboard-*.js` shows the wrap pattern is present:
+Inspecting `dist/assets/index-*.js` shows the wrap pattern Rolldown
+emits when CJS `require()` reaches an ESM module:
 
 ```js
-// Rolldown emits the ESM lazy-init thunk creator at the top of the chunk's
-// import target:
-o = (e, t) => () => (e && (t = e(e=0)), t)
-
-// d3-scale's `var unit = [0, 1]` ends up here instead of at module top:
-var dt, ft = o(() => { b(), et(), nt(), it(), dt = [0, 1]; });
-
-// And the transformer function reads `dt`:
-function transformer() {
-  var domain = dt, range = dt;       // ← undefined if ft() hasn't run
-  function rescale() { return Math.min(domain.length, range.length); }
-  // ...
-}
-
-// At chunk end, Rolldown emits an IIE that invokes the top-of-chunk init:
-e(() => { Xt(); })();
-// → Xt() → ft() → dt = [0, 1]    so by the time compute() runs, dt is set
+var fn;                                          // module-level binding (was const fn = () => 1)
+var init_lib_impl = __esmMin(() => { fn = () => 1; });   // deferred init
+function foo() { return fn(); }                  // exported function — reads `fn`
 ```
 
-If you flip `"type"` to `"module"` in `package.json` and rebuild, the wrap
-goes away entirely — `var unit = [0, 1]` ends up at chunk top level, eager,
-no thunk.
-
-## When the actual crash manifests
-
-In a production app with 100+ lazy `import()`s and a CJS workspace package,
-Rolldown emits a chunk like the one above **without** the trailing
-`e(() => {Xt();})();` IIE — i.e. the thunks are defined but never invoked
-anywhere reachable from the chunk's exported functions. When React calls the
-chunk's exported component → which calls `scaleLinear()` → which reads `dt`
-→ crash.
-
-In our case the chunk also exports 4 of its init thunks as named exports
-(`gl as default, _s as i, sc as n, bs as r, mc as t`), and Rolldown emits a
-**separate orphan chunk** (`esm.zzz-Uu7QKPL.js` in our build) that statically
-imports those thunks and creates more thunks of its own — but is never
-imported by anything else, and its own thunks have a missing trailing `()`:
-
-```js
-import { i as t, n, r, t as i } from "./dashboard.zzz<hash>.js";
-var a = e(() => {}), o = e(() => {}), ...;
-e(() => { t(), r(), a(), o(), ... });   // no trailing (); thunk is just defined
-e(() => { i(), u(), n() });              // ditto
-// no exports
-```
-
-We hypothesise Rolldown skipped the dashboard chunk's IIE because it
-concluded "the orphan chunk will invoke those thunks", but the orphan chunk
-is never loaded (and even if it were, it doesn't invoke its own thunks
-either).
+This pattern is from Rolldown's own test suite
+(`crates/rolldown/tests/rolldown/issues/rolldown_vite_289/`), where it
+verifies the init **is** called inline at the import location, so `foo()`
+works. We hit the same pattern in production, except the inline init
+call is **missing** and `foo()` (in our case `scaleLinear()`) crashes.
 
 ## The trigger
 
-[Per Rolldown's link-stage docs](https://www.atriiy.dev/blog/rolldown-link-stage-symbol-linking-resolution),
-`WrapKind::Esm` is set when an `ImportKind::Require` reaches a module with
-`ExportsKind::Esm`. The simplest way to inject that into your import graph is
-to set `"type": "commonjs"` on the consumer package — every ESM module the
-package imports through dynamic chunk boundaries then gets wrapped.
+[Per Rolldown's link-stage docs](https://www.atriiy.dev/blog/rolldown-link-stage-symbol-linking-resolution)
+and the source at
+`crates/rolldown/src/stages/link_stage/determine_module_exports_kind.rs`,
+`WrapKind::Esm` is set when an `ImportKind::Require` reaches a module
+with `ExportsKind::Esm`. Our consumer package has `"type": "commonjs"`,
+which causes Vite/Rolldown to treat its imports as CJS-style for interop
+purposes — every ESM module the package transitively requires gets
+wrapped.
+
+In this repro:
+
+- `src/trigger-wrapping.ts` does `require('./lib-impl')`, which marks
+  `lib-impl` as `WrapKind::Esm`
+- `wrap_module_recursively` then propagates the wrap into every module
+  `lib-impl` imports (and so on transitively)
+- The chunk emits all of those modules with lazy-init thunk bodies
+
+In production we don't write `require()` directly; the chain comes from
+CJS dependencies (e.g. MUI / emotion / react-transition-group) issuing
+`require()` calls that transitively reach visx → d3-scale → d3-array.
+
+## Workaround: `output.strictExecutionOrder: true` makes the crash go away
+
+Setting
+
+```ts
+build: {
+  rolldownOptions: {
+    output: { strictExecutionOrder: true },
+  },
+},
+```
+
+in `vite.config.ts` makes the bug disappear. Rolldown then injects a
+runtime helper that invokes every chunk's init thunks in declaration
+order, which is what the missing inline inits were supposed to do.
+Trade-off: bundle size grows substantially (in our production build, the
+main entry chunk inflated ~70%, from 572 kB to 967 kB, even with no other
+changes), because the option forces eager init everywhere and prevents
+some downstream code-splitting / dead-code elimination decisions.
+
+A targeted `renderChunk` plugin that scans for `var X = <helper>(() => {...})`
+thunks in affected chunks and appends `X1(),X2(),…,Xn();` after the chunk's
+`export` statement gets the same correctness without the size hit. We're
+shipping that as a stopgap; see *Our workaround* below.
 
 ## What we think Rolldown should do
 
 1. **Always emit a top-level invocation for every init thunk in a chunk.**
-   The thunks memoize, so the per-call cost is one call per module the first
-   time, then nothing. This is functionally what
-   `output.strictExecutionOrder: true` does globally — but the global option
-   inflates main chunk size ~70%.
-2. **Don't let orphan chunks influence chunking decisions in their
-   "producers".** If `chunkB` statically imports init thunks from `chunkA`
-   but nothing imports `chunkB`, the consumer relationship is fictional and
-   `chunkA` shouldn't skip its IIE on its account.
-3. **Don't emit thunk-creating expressions without an invocation.** Code like
-   `e(() => { sideEffect(); });` (no trailing `()`) just creates and discards
-   a thunk — the side effect never runs.
+   The thunks memoize, so the per-call cost is one call per module the
+   first time, then nothing. That's effectively what
+   `strictExecutionOrder: true` already does — but its bundle-size impact
+   suggests the wrong layer.
+2. **Insert the inline `init_X();` call at every cross-chunk import
+   site** where the importee is wrapped, the same way it does for
+   intra-chunk imports today
+   (`crates/rolldown/src/module_finalizers/mod.rs` →
+   `transform_or_remove_import_export_stmt` →
+   `WrapKind::Esm` branch).
+3. **Don't let an orphan chunk's static imports inform chunking decisions
+   in its "producer".** In our build, the only chunk that imports the
+   dashboard chunk's exported thunks is itself an orphan
+   (`esm.zzz-Uu7QKPL.js` — never imported by anything else); Rolldown
+   appears to skip the dashboard chunk's IIE based on that orphan's
+   imports, but the orphan never loads at runtime.
 
-## Our workaround
+## Our workaround (production)
 
-A small Vite plugin in `renderChunk` that scans the chunk for
-`var X = <helper>(() => {...})` thunks and appends
-`X1(),X2(),…,Xn();` after the chunk's `export` statement. Scoped to chunks
-that import `d3-*`, `internmap`, or `@visx/*`. Functionally a per-chunk
-`strictExecutionOrder` without the global bundle-size hit.
+A small Vite plugin that, in `renderChunk`, finds every
+`var X = <helper>(() => {...})` thunk in the chunk and appends
+`X1(),X2(),…,Xn();` after the `export` statement. Scoped to chunks that
+import `d3-*`, `internmap`, or `@visx/*`. Functionally a per-chunk
+`strictExecutionOrder` without the global bundle-size hit. Source
+available on request.
+
+## What this repro contains
+
+- `src/main.ts` — entry with two lazy routes:
+  `import('./trigger-error')` and `import('./trigger-wrapping')`
+- `src/lib-impl.ts` — exports `foo()` that reads a module-level `const fn`
+- `src/lib-index.ts` — `export * from './lib-impl'`
+- `src/trigger-error.ts` — imports `foo` via `lib-index`, asserts it
+  returns `1`
+- `src/trigger-wrapping.ts` — `require('./lib-impl')` — the trigger
+- `src/main.ts` — selects route based on `location.search`
+- `package.json` — note `"type": "commonjs"`
+- `test-crash.mjs` — hand-rolled emission that **does** crash, to show
+  the runtime symptom
+
+After `yarn build`, the emitted `dist/assets/index-*.js` shows the lazy
+thunk pattern. The chunks themselves don't crash in this minimal form
+because Rolldown also emits a top-level invocation that runs everything.
+Confirmed by:
+
+```sh
+cd /tmp/runtest                              # rename .js→.mjs first
+node -e "import('./trigger-error-*.mjs').then(m => console.log(m.check()))"
+# → 1
+```
+
+## What we couldn't reduce
+
+The production build's dashboard chunk has the same wrap pattern **but
+no top-level invocation**. We weren't able to reduce that omission to a
+minimal trigger. Things that don't seem to cause it on their own:
+
+- `"type": "commonjs"` alone → wrap happens, init still emitted, no crash
+- two lazy entries sharing wrapped modules → still works
+- many sub-component files imported by one lazy entry → still works
+- emotion `styled` + MUI imports in the same chunk → still works
+- larger chunk graphs (5-50 lazy splits) → still works
+
+It correlates with:
+
+- many lazy `import()`s (~150 in our build)
+- a CJS-typed workspace package importing visx/d3 via aliases
+- Rolldown emitting an orphan chunk that statically imports init thunks
+  from the dashboard chunk (`esm.zzz-Uu7QKPL.js`); the orphan's body
+  itself has thunk-creating expressions with **no trailing `()`**:
+  ```js
+  e(() => { t(), r(), a(), o(), ... });   // not invoked
+  ```
+
+We can share the production build's dashboard chunk privately if
+helpful.
+
+## Production crash, for reference
+
+```
+TypeError: Cannot read properties of undefined (reading 'length')
+    at u (continuous.js:78:29)            // Math.min(domain.length, range.length)
+    at Ri (continuous.js:124:23)          // continuous()
+    at Aa (linear.js:61:15)               // d3-scale linear()
+    at hs (linear.js:5:28)                // visx createLinearScale
+    at <Component> (activityChartReport.tsx:384)
+```
+
+Second flavor, from `scaleOrdinal`:
+
+```
+TypeError: Zt is not a constructor       // class extends Map (InternMap), defined inside an uncalled m(() => {...})
+    at dn (ordinal.js:7:15)               // var index = new InternMap()
+```
 
 ## Versions
 
 - `vite ^8.0.12` (Rolldown bundled)
-- `d3-scale 4.0.2`
 - Node 24, Yarn 4.12
-- `"type": "commonjs"` in `package.json` — the trigger
-
-## Files
-
-- `src/main.ts` — entry; lazy `import('./dashboard')`
-- `src/dashboard.ts` — uses `d3-scale`
-- `package.json` — note `"type": "commonjs"`
-- `vite.config.ts` — minimal config with sourcemaps
-- `verify-bug.mjs` — loads the built chunk via Node and reports
-- `test-crash.mjs` — hand-rolled emission that does crash, to show the symptom
-
-If a Rolldown maintainer wants to chase the missing-IIE case directly, I can
-share a private repro from the production app that does crash; the chunk
-shape is documented above under "When the actual crash manifests".
+- `"type": "commonjs"` in `package.json` — the wrap trigger
